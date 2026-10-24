@@ -7,7 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { ScannerController, type ScannerSnapshot } from '@/scanner/controller'
-import { readerOptions, type Profile, type Resolution } from '@/scanner/settings'
+import { binarizers, readerOptions, type CropSize, type Overlap, type SearchSettings } from '@/scanner/settings'
 
 const ms = (value: number | null | undefined) => value == null ? '—' : `${value.toFixed(1)} ms`
 
@@ -24,14 +24,14 @@ function SwipeRun({ snapshot }: { snapshot: ScannerSnapshot }) {
   function download() {
     const data = {
       exportedAt: new Date().toISOString(), userAgent: navigator.userAgent,
-      settings: readerOptions(snapshot.profile), ...snapshot,
+      ...snapshot, readerOptions: binarizers.map(readerOptions),
       manualSwipeTest: valid ? { attempted: total, captured: successes, successRate: successes / total } : null,
-      timingNote: 'Processing is frame capture to hashed result received, not code-entry-to-result latency. Percentiles cover the latest 1000 attempts per category.',
+      timingNote: 'Scene times include acquisition, search, hashing and worker round trips. First result is any decoded payload, including a repeat. Decoder timing is per WASM call. Percentiles cover the latest 1000 completed sweeps or calls. These are not code-entry-to-result times.',
     }
     const link = document.createElement('a')
     const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }))
     link.href = url
-    link.download = `aztec-${snapshot.profile}-${snapshot.resolution}-${Date.now()}.json`
+    link.download = `aztec-${snapshot.settings.cropSize}-${Date.now()}.json`
     link.click()
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
@@ -73,21 +73,21 @@ function App() {
   const status = snapshot?.status ?? 'starting'
   const active = status === 'starting' || status === 'scanning'
   function reset() { controllerRef.current?.reset(); setRunId((id) => id + 1) }
-  function configure(profile: Profile, resolution: Resolution) {
-    controllerRef.current?.configure(profile, resolution)
+  function configure(settings: SearchSettings) {
+    controllerRef.current?.configure(settings)
     setRunId((id) => id + 1)
   }
 
   return <main className="mx-auto max-w-2xl space-y-4 p-4 pb-8">
     <header className="flex items-center justify-between gap-4">
-      <div><h1 className="text-xl font-semibold">Find it</h1><p className="text-sm text-muted-foreground">Aztec swipe scanner</p></div>
+      <div><h1 className="text-xl font-semibold">Find it</h1><p className="text-sm text-muted-foreground">Aztec distance scanner</p></div>
       <Badge variant={status === 'scanning' ? 'default' : 'secondary'}>{status}</Badge>
     </header>
 
     <Card>
       <CardContent className="space-y-3">
         <video ref={videoRef} autoPlay muted playsInline aria-label="Live camera preview" className="aspect-[4/3] max-h-[50svh] w-full rounded-lg bg-muted object-contain" />
-        <p className="text-sm text-muted-foreground">Swipe over one dark-on-light Aztec code. Keep the label well lit and in focus.</p>
+        <p className="text-sm text-muted-foreground">Hold the camera toward the boxes. Each captured scene is searched fully for multiple Aztec codes before taking the next image. Keep labels well lit and in focus.</p>
         <div className="flex flex-wrap gap-2">
           {active ? <Button className="min-h-11" variant="outline" onClick={() => controllerRef.current?.pause()}>{status === 'starting' ? 'Cancel startup' : 'Pause'}</Button>
             : <Button className="min-h-11" onClick={() => void controllerRef.current?.start()}>{status === 'paused' ? 'Resume' : 'Start / Retry'}</Button>}
@@ -101,27 +101,35 @@ function App() {
 
     {snapshot && <>
       <Card>
-        <CardHeader><CardTitle>Live metrics</CardTitle><CardDescription>Updated once a second. Processing includes frame capture, decoding, hashing, and the worker round trip.</CardDescription></CardHeader>
+        <CardHeader><CardTitle>Live metrics</CardTitle><CardDescription>Results appear as each search pass finishes. Scene timings include capture, decoding, hashing, and the worker round trip.</CardDescription></CardHeader>
         <CardContent className="space-y-4">
           <dl className="grid grid-cols-2 gap-4 sm:grid-cols-3">
             <Metric label={snapshot.preciseFrames ? 'Preview FPS' : 'Preview FPS (estimated)'} value={snapshot.previewFps.toFixed(1)} />
-            <Metric label="Scans / second" value={snapshot.scansPerSecond.toFixed(1)} />
-            <Metric label="Processing p50" value={ms(snapshot.p50)} />
-            <Metric label="Processing p95" value={ms(snapshot.p95)} />
-            <Metric label="Empty result p50" value={ms(snapshot.emptyP50)} />
-            <Metric label="Successful result p50" value={ms(snapshot.successP50)} />
-            <Metric label="Decoder p50" value={ms(snapshot.decoderP50)} />
-            <Metric label="Busy frames skipped" value={snapshot.skipped} />
-            <Metric label="Completed scans" value={snapshot.attempts} />
+            <Metric label="Sweeps / second" value={snapshot.scansPerSecond.toFixed(1)} />
+            <Metric label="Sweep p50" value={ms(snapshot.sweepP50)} />
+            <Metric label="Sweep p95" value={ms(snapshot.sweepP95)} />
+            <Metric label="Decoder call p50" value={ms(snapshot.decoderP50)} />
+            <Metric label="Completed sweeps" value={snapshot.completedSweeps} />
+            <Metric label="Decoder calls" value={snapshot.decoderCalls} />
             <Metric label="Unique codes" value={snapshot.unique} />
             <Metric label="Duplicate reads" value={snapshot.duplicates} />
-            <Metric label="Empty results" value={snapshot.emptyResults} />
+            <Metric label="Empty scenes" value={snapshot.emptyScenes} />
+            <Metric label="Capture source" value={snapshot.captureSource || '—'} />
+            <Metric label="Scene dimensions" value={snapshot.scanSize || '—'} />
+            <Metric label="Capture duration" value={ms(snapshot.scene?.captureMs)} />
+            <Metric label="First result (last sweep)" value={ms(snapshot.lastCompleted?.firstResultMs)} />
+            <Metric label="Last sweep duration" value={ms(snapshot.lastCompleted?.sweepMs)} />
           </dl>
-          <p className="text-xs text-muted-foreground">Percentiles use the latest 1,000 samples per category ({snapshot.sampleCount} overall). Empty-result time includes searching and any failed decode attempts; it is not detection-only time. Preview FPS is not sensor FPS. These timings do not measure when a code first entered view.</p>
+          <div className="space-y-1 text-sm" aria-label="Search progress">
+            <p>{snapshot.scene?.stage || 'Waiting for capture'} · {snapshot.scene?.completed ?? 0} / {snapshot.scene?.total || '—'} passes</p>
+            <progress className="w-full" aria-label="Completed search passes" value={snapshot.scene?.completed ?? 0} max={snapshot.scene?.total || 1} />
+          </div>
+          {snapshot.fallbackReason && <p className="text-sm text-muted-foreground">{snapshot.fallbackReason}</p>}
+          <p className="text-xs text-muted-foreground">A sweep covers one captured scene. Both binarizers run on the overview and every crop. Duplicates count once per payload per later scene, regardless of overlapping crops. Percentiles use up to 1,000 samples ({snapshot.sampleCount} completed sweeps). Preview FPS is not sensor FPS; timings do not measure when a label entered view.</p>
           <details className="text-sm"><summary className="cursor-pointer">Camera and startup details</summary>
             <dl className="mt-3 grid grid-cols-2 gap-4">
               <Metric label="Camera settings" value={snapshot.camera || '—'} />
-              <Metric label="Processed frame" value={snapshot.scanSize || '—'} />
+              <Metric label="Original capture" value={snapshot.scene?.original || '—'} />
               <Metric label="Startup to preview" value={ms(snapshot.startupMs)} />
               <Metric label="WASM startup" value={ms(snapshot.wasmStartupMs)} />
             </dl>
@@ -131,21 +139,21 @@ function App() {
       </Card>
 
       <Card>
-        <CardHeader><CardTitle>Scan settings</CardTitle><CardDescription>Pause to change settings. Changing either starts a fresh run and clears results.</CardDescription></CardHeader>
+        <CardHeader><CardTitle>Advanced search settings</CardTitle><CardDescription>Pause to change settings. Changes and Reset run clear results and cancel the current scene. Resume to start a fresh run.</CardDescription></CardHeader>
         <CardContent className="space-y-4">
           <div className="flex flex-wrap gap-4">
-            <div className="space-y-2"><Label htmlFor="profile">Search profile</Label>
-              <NativeSelect id="profile" className="min-h-11" disabled={active} value={snapshot.profile} onChange={(event) => configure(event.target.value as Profile, snapshot.resolution)}>
-                <NativeSelectOption value="capture">Capture first</NativeSelectOption><NativeSelectOption value="fast">Fast</NativeSelectOption>
+            <div className="space-y-2"><Label htmlFor="crop-size">Crop size</Label>
+              <NativeSelect id="crop-size" className="min-h-11" disabled={active} value={snapshot.settings.cropSize} onChange={(event) => configure({ ...snapshot.settings, cropSize: Number(event.target.value) as CropSize })}>
+                {[768, 1024, 1536, 2048].map((size) => <NativeSelectOption key={size} value={size}>{size} px</NativeSelectOption>)}
               </NativeSelect>
             </div>
-            <div className="space-y-2"><Label htmlFor="resolution">Maximum frame edge</Label>
-              <NativeSelect id="resolution" className="min-h-11" disabled={active} value={snapshot.resolution} onChange={(event) => configure(snapshot.profile, Number(event.target.value) as Resolution)}>
-                <NativeSelectOption value="640">640 px</NativeSelectOption><NativeSelectOption value="1280">1280 px</NativeSelectOption><NativeSelectOption value="1920">1920 px</NativeSelectOption>
+            <div className="space-y-2"><Label htmlFor="overlap">Crop overlap</Label>
+              <NativeSelect id="overlap" className="min-h-11" disabled={active} value={snapshot.settings.overlap} onChange={(event) => configure({ ...snapshot.settings, overlap: Number(event.target.value) as Overlap })}>
+                {[0.25, 0.5, 0.75].map((overlap) => <NativeSelectOption key={overlap} value={overlap}>{overlap * 100}%</NativeSelectOption>)}
               </NativeSelect>
             </div>
           </div>
-          <p className="text-sm text-muted-foreground">Capture first searches more thoroughly and tries additional image scales. Fast disables both. Smaller frames cost less to process but may lose small or dense labels. Both scan the whole view for one valid Aztec code.</p>
+          <p className="text-sm text-muted-foreground">Prefer a still photo up to 25 megapixels, with video fallback. Search a 1920 px overview, then overlapping crops from the original pixels. Greater overlap takes longer. Still capture may briefly interrupt preview. Cropping cannot recover detail lost to blur or distance.</p>
         </CardContent>
       </Card>
 

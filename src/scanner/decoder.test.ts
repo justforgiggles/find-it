@@ -35,30 +35,56 @@ function frame(symbol?: BarcodeSymbol): ImageData {
 }
 
 describe('actual WASM decoding and session identity', () => {
-  it.each(['capture', 'fast'] as const)('decodes binary Aztec bytes with the %s profile', async (profile) => {
+  it.each(['LocalAverage', 'GlobalHistogram'] as const)('decodes binary Aztec bytes with the %s profile', async (profile) => {
     const payload = new Uint8Array([0, 1, 127, 128, 255, 65, 90, 84, 69, 67])
     const encoded = await writeBarcode(payload, { format: 'Aztec', rotate: 90 })
     expect(encoded.error).toBe('')
     const result = await decodeFrame(frame(encoded.symbol), profile)
-    expect(result.code).toEqual({ hash: createHash('sha256').update(payload).digest('hex'), byteLength: payload.length })
+    expect(result.codes).toEqual([{ hash: createHash('sha256').update(payload).digest('hex'), byteLength: payload.length }])
   })
 
   it('rejects blank frames and QR codes', async () => {
     const qr = await writeBarcode('not an Aztec code', { format: 'QRCode' })
-    expect((await decodeFrame(frame(), 'capture')).code).toBeNull()
-    expect((await decodeFrame(frame(qr.symbol), 'capture')).code).toBeNull()
+    expect((await decodeFrame(frame(), 'LocalAverage')).codes).toEqual([])
+    expect((await decodeFrame(frame(qr.symbol), 'LocalAverage')).codes).toEqual([])
   })
 
-  it('keeps one row for repeat reads and counts empty and duplicate results separately', async () => {
+  it('deduplicates overlapping passes within a scene and repeats across scenes', async () => {
     const barcode = await writeBarcode('box-1', { format: 'Aztec' })
-    const { code } = await decodeFrame(frame(barcode.symbol), 'capture')
-    expect(code).not.toBeNull()
+    const { codes } = await decodeFrame(frame(barcode.symbol), 'LocalAverage')
+    expect(codes).toHaveLength(1)
     const session = new ScanSession()
-    expect(session.record(code, 10, 8)).toBe(true)
-    expect(session.record(code, 20, 18)).toBe(false)
-    expect(session.record(null, 5, 3)).toBe(false)
-    expect(session.snapshot()).toMatchObject({ unique: 1, duplicates: 1, attempts: 3, emptyResults: 1, p50: 10, p95: 20, emptyP50: 5 })
-    expect(new ScanSession().record(code, 12, 9)).toBe(true)
+    const scene = { id: 1, source: 'video', width: 640, height: 480, original: '640 × 480', captureMs: 2 }
+    const progress = { codes, decodeMs: 8, completed: 1, total: 4, stage: 'Overview' }
+    session.begin(scene)
+    expect(session.record(progress, 10)).toBe(true)
+    expect(session.record(progress, 20)).toBe(false)
+    session.complete(25)
+    expect(session.snapshot()).toMatchObject({ unique: 1, duplicates: 0, completedSweeps: 1, decoderCalls: 2 })
+    session.begin({ ...scene, id: 2 })
+    session.record(progress, 15)
+    session.record(progress, 20)
+    session.complete(30)
+    expect(session.snapshot()).toMatchObject({ unique: 1, duplicates: 1, completedSweeps: 2, sweepP50: 25, sweepP95: 30 })
+    session.begin({ ...scene, id: 3 })
+    session.record({ ...progress, codes: [] }, 5)
+    session.complete(10)
+    expect(session.snapshot()).toMatchObject({ emptyScenes: 1, lastCompleted: { firstResultMs: null } })
+  })
+
+  it.each([['box-two', 2], ['box-one', 1]] as const)('handles two rotated labels with second payload %s as %i identities', async (payload, count) => {
+    const first = await writeBarcode('box-one', { format: 'Aztec' })
+    const second = await writeBarcode(payload, { format: 'Aztec', rotate: 270 })
+    const image = frame(first.symbol)
+    const other = frame(second.symbol)
+    for (let y = 0; y < image.height; y++) {
+      for (let x = 0; x < 300; x++) {
+        const src = (y * image.width + x) * 4
+        const dst = (y * image.width + x + 300) * 4
+        image.data.set(other.data.subarray(src, src + 4), dst)
+      }
+    }
+    expect((await decodeFrame(image, 'LocalAverage')).codes).toHaveLength(count)
   })
 
   it('preserves portrait framing and never upscales low-resolution camera input', () => {

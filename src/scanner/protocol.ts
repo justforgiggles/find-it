@@ -1,19 +1,20 @@
-import type { Profile } from './settings'
+import type { SearchSettings } from './settings'
 
-export interface FrameRequest {
-  epoch: number
-  rgba: ArrayBuffer
-  width: number
-  height: number
-  profile: Profile
+export interface SceneRequest {
+  sceneId: number
+  bitmap: ImageBitmap
+  settings: SearchSettings
 }
-
-export interface DecodedCode {
-  hash: string
-  byteLength: number
+export interface DecodedCode { hash: string; byteLength: number }
+export interface SearchProgress {
+  completed: number
+  total: number
+  stage: string
+  decodeMs: number
+  codes: DecodedCode[]
 }
-
 export type WorkerReply =
   | { type: 'ready'; startupMs: number }
-  | { type: 'result'; epoch: number; decodeMs: number; code: DecodedCode | null }
+  | ({ type: 'progress'; sceneId: number } & SearchProgress)
+  | { type: 'complete'; sceneId: number }
   | { type: 'error'; message: string }

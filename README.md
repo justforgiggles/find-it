@@ -28,20 +28,20 @@ Browser tests start a dedicated preview server on port 4189. They use generated 
 ## Use
 
 1. Open the page and allow the rear camera. Use **Start / Retry** if permission or playback needs a gesture.
-2. Briefly swipe over one dark-on-light Aztec label. A new decoded payload adds a SHA-256 hash row. Only the first 16 hex characters are displayed; deduplication uses all 64 characters of the hash of the raw bytes.
-3. Watch preview FPS, scans/second, processing p50/p95, empty/successful processing times, busy frames skipped, and result counts.
-4. **Pause** releases the camera. Resume retains results. Reset clears metrics and payload identities. Backgrounding the page pauses scanning; resume explicitly after returning.
-5. Pause to change profile or frame size. Each setting change clears the run to avoid mixing measurements. Download the run JSON before changing settings.
+2. Hold the camera toward the boxes. The scanner searches each captured scene for multiple dark-on-light Aztec labels, including overlapping crops for smaller distant labels. Results appear incrementally as hash rows.
+3. Watch capture source/dimensions, crop progress, completed sweeps, first-result and sweep duration, decoder calls, preview FPS, and unique/duplicate counts.
+4. **Pause** releases the camera. Resume retains results. **Reset run** cancels the current scene, clears metrics and identities, and leaves the camera paused. Backgrounding also pauses; resume explicitly on return.
+5. Pause to change crop size or overlap under Advanced search settings. Changes clear the run. Download the run JSON first if you want to retain measurements.
 
-All frame processing stays in the browser. No images or payloads are uploaded, and no results are persisted. Duplicate payloads still have to be decoded to recognize them. Invalid reads never become results.
+All image processing stays in the browser. No images or payloads are uploaded, and no results are persisted. Deduplication uses the full SHA-256 of decoded bytes; the UI shows its first 16 hex characters. Two boxes with identical payloads produce one row. Overlapping crop hits count only once within a scene, and at most one duplicate per payload is counted in each later scene.
 
 ## Performance approach
 
-The default is **Capture first**, with a maximum processed frame edge of **1280 pixels**. It is a starting configuration, not a proven optimum for an unspecified phone and label. **Fast** removes the more thorough search and additional downscaled searches. Both restrict reading to one Aztec symbol and keep local-average binarization, rotation support, and error rejection enabled. Inverted-label search and denoising are disabled for the agreed label type.
+The default prefers a high-resolution still photo up to **25 MP**, with runtime-detected video fallback. It searches a **1920-pixel overview**, then **1536-pixel native crops at 50% overlap**, running LocalAverage and GlobalHistogram on every view. Aztec-only reading accepts all valid symbols, enables thorough search and rotation, and disables internal downscaling, inversion, and denoising. Crops are never synthetically upscaled.
 
-The camera requests the rear lens, an ideal 60 fps, and a resolution suited to the selected processing size. These are preferences: the browser/device chooses the actual settings, shown in the UI. The entire camera image is processed without a center crop. Frames are never upscaled.
+Distance recovery now takes priority over brief-swipe throughput. One captured scene is searched completely before the next capture. A worker performs decoder calls, publishes incremental results, and releases scene resources when finished. Pause/reset/backgrounding cancel work and reject stale results. Still capture can briefly interrupt preview. Actual source dimensions and camera settings are shown; hardware capabilities vary.
 
-The reader-only WASM asset is bundled and served from the same GitHub Pages site. It initializes alongside camera acquisition in a dedicated worker. One frame is in flight at a time; new frames are skipped while busy, rather than queued. The main thread captures RGBA pixels and transfers their buffer. React metrics update once per second, with immediate updates only for new results and controls.
+These settings are a measured starting point for the supplied examples, not a proven phone optimum. Cropping cannot restore detail lost to blur or insufficient source pixels. Real examples are kept local and excluded from public CI; the local-only comparison harness is documented below.
 
 See [scanning configuration and measurement notes](docs/scanning.md) and the [agreed design](docs/scanner-plan.md).
 

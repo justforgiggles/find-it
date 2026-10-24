@@ -1,19 +1,19 @@
-import type { FrameRequest, WorkerReply } from './protocol'
+import type { SceneRequest, WorkerReply } from './protocol'
 import { ScanSession } from './session'
-import { frameSize, type Profile, type Resolution } from './settings'
+import { defaultSettings, type SearchSettings } from './settings'
+import { SceneCamera } from './capture'
 
 type Status = 'idle' | 'starting' | 'scanning' | 'paused' | 'error'
 
 export class ScannerController {
   private video: HTMLVideoElement
-  private canvas = document.createElement('canvas')
-  private context = this.canvas.getContext('2d', { willReadFrequently: true })
+  private sceneCamera: SceneCamera | null = null
   private notify: () => void
   private stream: MediaStream | null = null
   private worker: Worker | null = null
   private session = new ScanSession()
   private generation = 0
-  private epoch = 0
+  private sceneId = 0
   private busy = false
   private sentAt = 0
   private callback = 0
@@ -31,8 +31,9 @@ export class ScannerController {
   status: Status = 'idle'
   error = ''
   notice = ''
-  profile: Profile = 'capture'
-  resolution: Resolution = 1280
+  settings: SearchSettings = { ...defaultSettings }
+  captureSource = ''
+  fallbackReason = ''
   previewFps = 0
   scansPerSecond = 0
   startupMs: number | null = null
@@ -52,7 +53,7 @@ export class ScannerController {
   snapshot() {
     return {
       status: this.status, error: this.error, notice: this.notice,
-      profile: this.profile, resolution: this.resolution,
+      settings: { ...this.settings }, captureSource: this.captureSource, fallbackReason: this.fallbackReason,
       previewFps: this.previewFps, scansPerSecond: this.scansPerSecond,
       startupMs: this.startupMs, wasmStartupMs: this.wasmStartupMs,
       camera: this.camera, scanSize: this.scanSize, preciseFrames: this.preciseFrames,
@@ -73,7 +74,7 @@ export class ScannerController {
     this.notify()
     try {
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera access requires HTTPS or localhost and a supported browser.')
-      if (!this.context) throw new Error('This browser cannot capture video frames.')
+      if (typeof createImageBitmap !== 'function' || typeof OffscreenCanvas !== 'function') throw new Error('This browser needs ImageBitmap and OffscreenCanvas support. Please update your browser.')
       const worker = new Worker(new URL('./scanner.worker.ts', import.meta.url), { type: 'module' })
       this.worker = worker
       const ready = new Promise<void>((resolve, reject) => {
@@ -91,15 +92,18 @@ export class ScannerController {
           } else if (data.type === 'error') {
             this.fail(data.message)
           } else {
+            if (data.sceneId !== this.sceneId || this.status !== 'scanning') return
             clearTimeout(this.watchdog)
-            this.busy = false
-            if (data.epoch !== this.epoch || this.status !== 'scanning') return
-            this.windowAttempts++
-            const isNew = this.session.record(data.code, performance.now() - this.sentAt, data.decodeMs)
-            if (isNew && data.code) {
-              this.notice = `New code: ${data.code.hash.slice(0, 16)}`
-              this.notify()
+            if (data.type === 'progress') {
+              const added = this.session.record(data, performance.now() - this.sentAt)
+              if (added) this.notice = `New code: ${this.session.rows[0].hash.slice(0, 16)}`
+              this.watchdog = setTimeout(() => this.fail('A decoder call stalled. Please retry.'), 30000)
+            } else {
+              this.session.complete(performance.now() - this.sentAt)
+              this.busy = false
+              this.windowAttempts++
             }
+            this.notify()
           }
         }
       })
@@ -108,9 +112,9 @@ export class ScannerController {
         audio: false,
         video: {
           facingMode: { ideal: 'environment' },
-          width: { ideal: Math.max(1280, this.resolution) },
-          height: { ideal: Math.max(720, Math.round(this.resolution * 9 / 16)) },
-          frameRate: { ideal: 60 },
+          width: { ideal: 4096 },
+          height: { ideal: 3072 },
+          frameRate: { ideal: 30 },
         },
       }).then((stream) => {
         if (generation !== this.generation) {
@@ -119,6 +123,7 @@ export class ScannerController {
         }
         this.stream = stream
         const track = stream.getVideoTracks()[0]
+        this.sceneCamera = new SceneCamera(track)
         const settings = track.getSettings()
         this.camera = `${settings.width ?? '?'} × ${settings.height ?? '?'} · ${settings.frameRate?.toFixed(0) ?? '?'} fps reported`
         track.onended = () => this.fail('Camera access ended. Tap Start / Retry to reconnect.')
@@ -161,21 +166,20 @@ export class ScannerController {
   }
 
   reset() {
-    this.epoch++
+    // Termination cancels the active sweep; a late acquisition is closed by its generation guard.
+    this.pause()
     this.session = new ScanSession()
     this.notice = ''
-    this.previewFps = 0
-    this.scansPerSecond = 0
+    this.captureSource = ''
+    this.scanSize = ''
+    this.fallbackReason = ''
     this.resetRateWindow()
     this.notify()
   }
 
-  configure(profile: Profile, resolution: Resolution) {
+  configure(settings: SearchSettings) {
     if (this.status === 'starting' || this.status === 'scanning') return
-    this.profile = profile
-    this.resolution = resolution
-    this.scanSize = ''
-    this.camera = ''
+    this.settings = { ...settings }
     this.reset()
   }
 
@@ -204,7 +208,7 @@ export class ScannerController {
         const frames = this.lastPresented === undefined ? 1 : Math.max(1, metadata.presentedFrames - this.lastPresented)
         this.lastPresented = metadata.presentedFrames
         this.windowFrames += frames
-        this.capture()
+        void this.capture()
         this.scheduleFrame()
       })
     } else {
@@ -212,34 +216,38 @@ export class ScannerController {
         if (this.video.currentTime !== this.lastVideoTime) {
           this.lastVideoTime = this.video.currentTime
           this.windowFrames++
-          this.capture()
+          void this.capture()
         }
         this.scheduleFrame()
       })
     }
   }
 
-  private capture() {
-    if (this.status !== 'scanning' || !this.worker || !this.context || this.video.readyState < 2) return
-    if (this.busy) { this.session.skipped++; return }
-    if (!this.video.videoWidth || !this.video.videoHeight) return
+  private async capture() {
+    if (this.status !== 'scanning' || !this.worker || !this.sceneCamera || this.video.readyState < 2) return
+    if (this.busy || !this.video.videoWidth || !this.video.videoHeight) return
+    const generation = this.generation
+    const current = () => generation === this.generation && this.status === 'scanning'
+    this.busy = true
+    this.sentAt = performance.now()
+    this.watchdog = setTimeout(() => this.fail('Camera capture stalled. Please retry.'), 45000)
     try {
-      this.busy = true
-      this.sentAt = performance.now()
-      const { width, height } = frameSize(this.video.videoWidth, this.video.videoHeight, this.resolution)
-      if (this.canvas.width !== width || this.canvas.height !== height) {
-        this.canvas.width = width
-        this.canvas.height = height
-        this.scanSize = `${width} × ${height}`
-      }
-      this.context.drawImage(this.video, 0, 0, width, height)
-      const pixels = this.context.getImageData(0, 0, width, height)
-      const rgba = pixels.data.buffer as ArrayBuffer
-      const request: FrameRequest = { epoch: this.epoch, rgba, width, height, profile: this.profile }
-      this.worker.postMessage(request, [rgba])
-      this.watchdog = setTimeout(() => this.fail('A scan stalled. Please retry.'), 15000)
+      const captured = await this.sceneCamera.capture(this.video, current)
+      if (!captured) return
+      if (!current() || !this.worker) { captured.bitmap.close(); return }
+      const { bitmap, source, width, height, original, captureMs, fallbackReason } = captured
+      this.captureSource = source === 'still' ? 'High-resolution still' : 'Video frame'
+      this.fallbackReason = fallbackReason
+      this.scanSize = `${width} × ${height}`
+      const sceneId = ++this.sceneId
+      this.session.begin({ id: sceneId, source, width, height, original, captureMs })
+      const request: SceneRequest = { sceneId, bitmap, settings: { ...this.settings } }
+      try { this.worker.postMessage(request, [bitmap]) } catch (error) { bitmap.close(); throw error }
+      clearTimeout(this.watchdog)
+      this.watchdog = setTimeout(() => this.fail('A decoder call stalled. Please retry.'), 30000)
+      this.notify()
     } catch (error) {
-      this.fail(error instanceof Error ? error.message : 'Could not capture a camera frame.')
+      if (current()) this.fail(error instanceof Error ? error.message : 'Could not capture a camera image.')
     }
   }
 
@@ -262,6 +270,7 @@ export class ScannerController {
     this.worker = null
     this.stream?.getTracks().forEach((track) => { track.onended = null; track.stop() })
     this.stream = null
+    this.sceneCamera = null
     this.video.pause()
     this.video.srcObject = null
     this.busy = false
